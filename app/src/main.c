@@ -18,6 +18,7 @@
 #include "util/net.h"
 #include "util/thread.h"
 #include "version.h"
+#include "microphone.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -75,11 +76,16 @@ main_scrcpy(int argc, char *argv[]) {
     av_register_all();
 #endif
 
+/*
 #ifdef HAVE_V4L2
     if (args.opts.v4l2_device) {
         avdevice_register_all();
     }
 #endif
+*/
+
+    //needed for capturing microphone
+    avdevice_register_all();
 
     if (!net_init()) {
         ret = SCRCPY_EXIT_FAILURE;
