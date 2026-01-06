@@ -7,6 +7,8 @@ import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
 import android.media.MediaRecorder;
+import android.os.Build;
+import android.telephony.TelephonyManager;
 
 import com.genymobile.scrcpy.util.Ln;
 
@@ -43,6 +45,21 @@ public final class AudioInjector {
     public static void injectAudio(PipedInputStream pis) throws Exception {
         Context systemContext = Workarounds.getSystemContext();
         Objects.requireNonNull(systemContext);
+
+        // Detect if there's an active phone call
+        boolean inCall = false;
+        try {
+            TelephonyManager telephonyManager =
+                (TelephonyManager) systemContext.getSystemService(Context.TELEPHONY_SERVICE);
+            if (telephonyManager != null) {
+                int callState = telephonyManager.getCallState();
+                inCall = (callState == TelephonyManager.CALL_STATE_OFFHOOK);
+                Ln.i("Call state: " + callState + " (OFFHOOK=" + TelephonyManager.CALL_STATE_OFFHOOK + ")");
+                Ln.i("In call: " + inCall);
+            }
+        } catch (Exception e) {
+            Ln.w("Could not check call state", e);
+        }
 
         // var audioMixRuleBuilder = new AudioMixingRule.Builder();
         @SuppressLint("PrivateApi")
@@ -103,6 +120,17 @@ public final class AudioInjector {
         int ROUTE_FLAG_LOOP_BACK = 0x1 << 1;
         setRouteFlagsMethod.invoke(audioMixBuilder, ROUTE_FLAG_LOOP_BACK);
 
+        if (inCall && Build.VERSION.SDK_INT >= 30) {
+            try {
+                Method setCallRedirectionMethod =
+                    audioMixBuilder.getClass().getDeclaredMethod("setCallRedirection", boolean.class);
+                setCallRedirectionMethod.invoke(audioMixBuilder, true);
+                Ln.i("Call redirection enabled on AudioMix");
+            } catch (Exception e) {
+                Ln.w("Could not enable call redirection on AudioMix: " + e.getMessage());
+            }
+        }
+
         // var audioMix = audioMixBuilder.build();
         Method audioMixBuildMethod = audioMixBuilder.getClass().getDeclaredMethod("build");
         Object audioMix = audioMixBuildMethod.invoke(audioMixBuilder);
@@ -145,22 +173,59 @@ public final class AudioInjector {
         AudioTrack audioTrack = (AudioTrack) createAudioTrackSourceMethod.invoke(audioPolicy, audioMix);
         Objects.requireNonNull(audioTrack);
 
+        int state = audioTrack.getState();
+        Ln.i("AudioTrack state: " + state + " (INITIALIZED=" + AudioTrack.STATE_INITIALIZED + ")");
+        if (state != AudioTrack.STATE_INITIALIZED) {
+            Ln.e("AudioTrack not initialized properly, state=" + state);
+            throw new Exception("AudioTrack creation failed with state " + state);
+        }
+
         audioTrack.play();
+
+        int playState = audioTrack.getPlayState();
+        Ln.i("AudioTrack playback state: " + playState + " (PLAYING=" + AudioTrack.PLAYSTATE_PLAYING + ")");
+        if (playState != AudioTrack.PLAYSTATE_PLAYING) {
+            Ln.e("AudioTrack failed to start playing, playState=" + playState);
+            throw new Exception("AudioTrack playback failed to start, playState=" + playState);
+        }
+
+        Ln.i("successfull: " + inCall);
 
         new Thread(() -> {
             byte[] audioBuffer = new byte[4096];
+            int writeAttempts = 0;
+            int consecutiveErrors = 0;
+
             while (true) {
                 try {
                     int bytesRead = pis.read(audioBuffer);
                     if (bytesRead <= 0) {
                         break;
                     }
-                    audioTrack.write(audioBuffer, 0, bytesRead);
+
+                    int written = audioTrack.write(audioBuffer, 0, bytesRead);
+                    writeAttempts++;
+
+                    if (written < 0) {
+                        consecutiveErrors++;
+                        Ln.e("AudioTrack write error: " + written + " (attempt " + writeAttempts + ")");
+
+                        if (consecutiveErrors >= 5) {
+                            Ln.e("Multiple consecutive write errors");
+                            break;
+                        }
+                    } else {
+                        consecutiveErrors = 0;
+                    }
                 } catch (Exception e) {
                     Ln.e("Audio injection error", e);
                     break;
                 }
             }
+
+            Ln.i("Audio injection thread ending");
+            audioTrack.stop();
+            audioTrack.release();
         }, "client-audio-injector").start();
     }
 }
